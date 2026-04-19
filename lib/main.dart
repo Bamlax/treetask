@@ -1,11 +1,13 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
 import 'pages/tag_management_page.dart';
+import 'pages/group_management_page.dart';
 import 'pages/filter_page.dart';
-import 'widgets/task_bottom_sheet.dart'; // 引入全新的底部面板
+import 'pages/settings_page.dart';
+import 'widgets/task_bottom_sheet.dart';
 import 'models/filter_model.dart';
 import 'models/task_model.dart';
 import 'db/database_helper.dart';
-import 'pages/settings_page.dart';
 
 void main() => runApp(const TreeTaskApp());
 
@@ -16,9 +18,14 @@ class TreeTaskApp extends StatelessWidget {
     return MaterialApp(
       title: 'TreeTask',
       debugShowCheckedModeBanner: false,
+      localizationsDelegates: const [
+        GlobalMaterialLocalizations.delegate,
+        GlobalWidgetsLocalizations.delegate,
+        GlobalCupertinoLocalizations.delegate,
+      ],
+      supportedLocales: const [Locale('zh', 'CN')],
       theme: ThemeData(
-        useMaterial3: true,
-        scaffoldBackgroundColor: Colors.white,
+        useMaterial3: true, scaffoldBackgroundColor: Colors.white,
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.lightBlue, primary: Colors.lightBlue),
         appBarTheme: const AppBarTheme(backgroundColor: Colors.lightBlue, foregroundColor: Colors.white, centerTitle: true, elevation: 0),
       ),
@@ -38,31 +45,39 @@ class _HomePageState extends State<HomePage> {
   String? _selectedGroupId; 
   List<TaskFilter> _filters = [];
   Map<String, List<TreeTaskItem>> _tasksMap = {};
+  
   bool _isLoading = false;
+  bool _isDynamicHeight = false; 
+  double _fixedRatio = 0.8;      
 
   @override
-  void initState() {
-    super.initState();
-    _loadData();
-  }
+  void initState() { super.initState(); _loadData(); }
 
   Future<void> _loadData({bool showLoading = true}) async {
     if (showLoading) setState(() => _isLoading = true);
     try {
+      final mode = await DatabaseHelper.instance.getSetting('height_mode');
+      final ratioStr = await DatabaseHelper.instance.getSetting('fixed_ratio');
+      final dynamicMode = mode == 'dynamic';
+      final ratio = ratioStr != null ? double.parse(ratioStr) : 0.8;
+
       final groups = await DatabaseHelper.instance.getGroups();
       final filters = await DatabaseHelper.instance.getSavedFilters(_selectedGroupId);
       final Map<String, List<TreeTaskItem>> newTasksMap = {};
       for (var filter in filters) {
         if (filter.id != null) newTasksMap[filter.id!] = await DatabaseHelper.instance.getFilteredTasks(filter);
       }
-      if (mounted) {
-        setState(() {
-          _groups = groups; _filters = filters; _tasksMap = newTasksMap;
-        });
+      
+      if (mounted) { 
+        setState(() { 
+          _isDynamicHeight = dynamicMode;
+          _fixedRatio = ratio;
+          _groups = groups; 
+          _filters = filters; 
+          _tasksMap = newTasksMap; 
+        }); 
       }
-    } finally {
-      if (mounted && showLoading) setState(() => _isLoading = false);
-    }
+    } finally { if (mounted && showLoading) setState(() => _isLoading = false); }
   }
 
   Future<void> _toggleTaskStatus(String filterId, TreeTaskItem task, bool val) async {
@@ -71,7 +86,7 @@ class _HomePageState extends State<HomePage> {
       if (taskIndex != -1) {
         _tasksMap[filterId]![taskIndex] = TreeTaskItem(
           id: task.id, title: task.title, description: task.description, 
-          targetTime: task.targetTime, tags: task.tags, isCompleted: val
+          targetTime: task.targetTime, tags: task.tags, isCompleted: val, sortOrder: task.sortOrder
         );
       }
     });
@@ -79,48 +94,85 @@ class _HomePageState extends State<HomePage> {
     _loadData(showLoading: false);
   }
 
+  Widget _buildDraggableFilterCard(TaskFilter filter, bool isDynamic) {
+    final tasks = _tasksMap[filter.id!] ?? [];
+    return DragTarget<TaskFilter>(
+      onWillAcceptWithDetails: (details) => details.data.id != filter.id,
+      onAcceptWithDetails: (details) async { await DatabaseHelper.instance.swapFilterOrder(details.data, filter); _loadData(showLoading: false); },
+      builder: (context, candidateData, rejectedData) {
+        final isHovered = candidateData.isNotEmpty;
+        return LongPressDraggable<TaskFilter>(
+          delay: const Duration(seconds: 1), 
+          data: filter,
+          feedback: Material(
+            color: Colors.transparent, 
+            child: SizedBox(
+              width: MediaQuery.of(context).size.width / 2 - 15, 
+              height: isDynamic ? null : (MediaQuery.of(context).size.width / 2 - 15) / _fixedRatio, 
+              child: Opacity(opacity: 0.85, child: _buildBlockCard(filter, tasks, isHovered: true, isDynamicHeight: isDynamic))
+            )
+          ),
+          childWhenDragging: Opacity(opacity: 0.2, child: _buildBlockCard(filter, tasks, isDynamicHeight: isDynamic)),
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 200), transform: isHovered ? Matrix4.translationValues(0, -4, 0) : Matrix4.identity(),
+            decoration: BoxDecoration(borderRadius: BorderRadius.circular(16), boxShadow: isHovered ? [BoxShadow(color: Colors.lightBlue.withValues(alpha: 0.4), blurRadius: 8, spreadRadius: 2)] : []),
+            child: _buildBlockCard(filter, tasks, isHovered: isHovered, isDynamicHeight: isDynamic),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildBoardContent() {
+    if (_filters.isEmpty) return const Center(child: Text('当前分组没有集子\n点击右上角 + 号新建', textAlign: TextAlign.center, style: TextStyle(color: Colors.grey)));
+    
+    if (_isDynamicHeight) {
+      List<Widget> leftCol = [];
+      List<Widget> rightCol = [];
+      for (int i = 0; i < _filters.length; i++) {
+        Widget card = Padding(padding: const EdgeInsets.only(bottom: 10), child: _buildDraggableFilterCard(_filters[i], true));
+        if (i % 2 == 0) leftCol.add(card); else rightCol.add(card);
+      }
+      return SingleChildScrollView(
+        padding: const EdgeInsets.symmetric(horizontal: 10.0, vertical: 10.0),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Expanded(child: Column(children: leftCol)),
+            const SizedBox(width: 10),
+            Expanded(child: Column(children: rightCol)),
+          ],
+        ),
+      );
+    } else {
+      return Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 10.0, vertical: 10.0),
+        child: GridView.builder(
+          gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(crossAxisCount: 2, crossAxisSpacing: 10, mainAxisSpacing: 10, childAspectRatio: _fixedRatio),
+          itemCount: _filters.length,
+          itemBuilder: (context, index) => _buildDraggableFilterCard(_filters[index], false),
+        ),
+      );
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
         title: const Text('TreeTask'),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.add),
-            tooltip: '新建集子',
-            onPressed: () async {
-              final result = await Navigator.push(context, MaterialPageRoute(builder: (_) => const FilterPage()));
-              if (result == true) _loadData();
-            },
-          ),
-        ],
+        actions: [IconButton(icon: const Icon(Icons.add), tooltip: '新建集子', onPressed: () async { final result = await Navigator.push(context, MaterialPageRoute(builder: (_) => const FilterPage())); if (result == true) _loadData(); })],
       ),
       drawer: Drawer(
         child: Column(children: [
-          const DrawerHeader(
-            decoration: BoxDecoration(color: Colors.lightBlue), 
-            child: SizedBox(width: double.infinity, child: Column(mainAxisAlignment: MainAxisAlignment.end, children: [Icon(Icons.account_tree, color: Colors.white, size: 48), SizedBox(height: 12), Text('TreeTask', style: TextStyle(color: Colors.white, fontSize: 24, fontWeight: FontWeight.bold))]))
-          ),
-          Expanded(
-            child: ListView(
-              padding: EdgeInsets.zero,
-              children: [
-                ListTile(
-                  leading: const Icon(Icons.label_outline, color: Colors.lightBlue), 
-                  title: const Text('标签管理'), 
-                  onTap: () { Navigator.pop(context); Navigator.push(context, MaterialPageRoute(builder: (_) => const TagManagementPage())); }
-                ),
-              ],
-            ),
-          ),
-          // 底部的设置入口
+          const DrawerHeader(decoration: BoxDecoration(color: Colors.lightBlue), child: SizedBox(width: double.infinity, child: Column(mainAxisAlignment: MainAxisAlignment.end, children: [Icon(Icons.account_tree, color: Colors.white, size: 48), SizedBox(height: 12), Text('TreeTask', style: TextStyle(color: Colors.white, fontSize: 24, fontWeight: FontWeight.bold))]))),
+          Expanded(child: ListView(padding: EdgeInsets.zero, children: [
+            ListTile(leading: const Icon(Icons.label_outline, color: Colors.lightBlue), title: const Text('标签管理'), onTap: () { Navigator.pop(context); Navigator.push(context, MaterialPageRoute(builder: (_) => const TagManagementPage())); }),
+            ListTile(leading: const Icon(Icons.folder_outlined, color: Colors.lightBlue), title: const Text('分组管理'), onTap: () { Navigator.pop(context); Navigator.push(context, MaterialPageRoute(builder: (_) => const GroupManagementPage())).then((_) => _loadData()); }),
+          ])),
           const Divider(height: 1, color: Colors.black12),
-          ListTile(
-            leading: const Icon(Icons.settings_outlined, color: Colors.black54), 
-            title: const Text('设置', style: TextStyle(color: Colors.black87)), 
-            onTap: () { Navigator.pop(context); Navigator.push(context, MaterialPageRoute(builder: (_) => const SettingsPage())); }
-          ),
-          const SizedBox(height: 16), // 底部留白
+          ListTile(leading: const Icon(Icons.settings_outlined, color: Colors.black54), title: const Text('设置', style: TextStyle(color: Colors.black87)), onTap: () { Navigator.pop(context); Navigator.push(context, MaterialPageRoute(builder: (_) => const SettingsPage())).then((_) => _loadData(showLoading: false)); }),
+          const SizedBox(height: 16),
         ]),
       ),
       body: Column(
@@ -129,174 +181,187 @@ class _HomePageState extends State<HomePage> {
           Container(
             height: 50,
             decoration: BoxDecoration(border: Border(bottom: BorderSide(color: Colors.grey.shade200))),
-            child: ListView(
-              scrollDirection: Axis.horizontal,
-              padding: const EdgeInsets.symmetric(horizontal: 8),
+            child: Row(
               children: [
                 Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 4),
+                  padding: const EdgeInsets.symmetric(horizontal: 12),
                   child: ChoiceChip(label: const Text('默认'), selected: _selectedGroupId == null, selectedColor: Colors.lightBlue.shade100, side: BorderSide.none, onSelected: (s) { if (s) { setState(() => _selectedGroupId = null); _loadData(); } }),
                 ),
-                ..._groups.map((g) => Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 4),
-                  child: ChoiceChip(label: Text(g.name), selected: _selectedGroupId == g.id, selectedColor: Colors.lightBlue.shade100, side: BorderSide.none, onSelected: (s) { if (s) { setState(() => _selectedGroupId = g.id); _loadData(); } }),
-                )),
+                Expanded(
+                  child: ReorderableListView(
+                    scrollDirection: Axis.horizontal,
+                    proxyDecorator: (Widget child, int index, Animation<double> animation) { return Material(color: Colors.transparent, child: child); },
+                    onReorder: (oldIndex, newIndex) async {
+                      if (newIndex > oldIndex) newIndex -= 1;
+                      final item = _groups.removeAt(oldIndex);
+                      _groups.insert(newIndex, item);
+                      setState(() {});
+                      await DatabaseHelper.instance.updateGroupOrders(_groups);
+                      _loadData(showLoading: false);
+                    },
+                    children: _groups.map((g) => Padding(
+                      key: ValueKey(g.id),
+                      padding: const EdgeInsets.only(right: 8, top: 8, bottom: 8),
+                      child: ChoiceChip(label: Text(g.name), selected: _selectedGroupId == g.id, selectedColor: Colors.lightBlue.shade100, side: BorderSide.none, onSelected: (s) { if (s) { setState(() => _selectedGroupId = g.id); _loadData(); } }),
+                    )).toList(),
+                  ),
+                ),
               ],
             ),
           ),
           
           Expanded(
-            child: _isLoading ? const Center(child: CircularProgressIndicator()) :
-              _filters.isEmpty ? const Center(child: Text('当前分组没有集子\n点击右上角 + 号新建', textAlign: TextAlign.center, style: TextStyle(color: Colors.grey))) :
-              Padding(
-                // 看板整体边距调整
-                padding: const EdgeInsets.symmetric(horizontal: 10.0, vertical: 10.0),
-                child: GridView.builder(
-                  // 间距缩小 2px (从12变为10)
-                  gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(crossAxisCount: 2, crossAxisSpacing: 10, mainAxisSpacing: 10, childAspectRatio: 0.8),
-                  itemCount: _filters.length,
-                  itemBuilder: (context, index) {
-                    final filter = _filters[index];
-                    final tasks = _tasksMap[filter.id!] ?? [];
-
-                    return DragTarget<TaskFilter>(
-                      onWillAcceptWithDetails: (details) => details.data.id != filter.id,
-                      onAcceptWithDetails: (details) async {
-                        await DatabaseHelper.instance.swapFilterOrder(details.data, filter);
-                        _loadData(showLoading: false);
-                      },
-                      builder: (context, candidateData, rejectedData) {
-                        final isHovered = candidateData.isNotEmpty;
-                        return LongPressDraggable<TaskFilter>(
-                          delay: const Duration(milliseconds: 150),
-                          data: filter,
-                          feedback: Material(
-                            color: Colors.transparent,
-                            child: SizedBox(
-                              width: MediaQuery.of(context).size.width / 2 - 15,
-                              height: (MediaQuery.of(context).size.width / 2 - 15) / 0.8,
-                              child: Opacity(opacity: 0.85, child: _buildBlockCard(filter, tasks, isHovered: true)),
-                            ),
-                          ),
-                          childWhenDragging: Opacity(opacity: 0.2, child: _buildBlockCard(filter, tasks)),
-                          child: AnimatedContainer(
-                            duration: const Duration(milliseconds: 200),
-                            transform: isHovered ? Matrix4.translationValues(0, -4, 0) : Matrix4.identity(),
-                            decoration: BoxDecoration(
-                              borderRadius: BorderRadius.circular(16),
-                              boxShadow: isHovered ? [BoxShadow(color: Colors.lightBlue.withOpacity(0.4), blurRadius: 8, spreadRadius: 2)] : [],
-                            ),
-                            child: _buildBlockCard(filter, tasks, isHovered: isHovered),
-                          ),
-                        );
-                      },
-                    );
-                  },
-                ),
-              ),
+            child: _isLoading ? const Center(child: CircularProgressIndicator()) : _buildBoardContent(),
           ),
         ],
       ),
       floatingActionButton: FloatingActionButton(
         backgroundColor: Colors.lightBlue, elevation: 2,
-        onPressed: () async {
-          // 全局新建面板
-          final result = await TaskBottomSheet.show(context);
-          if (result == true) _loadData(showLoading: false);
-        },
+        onPressed: () async { final result = await TaskBottomSheet.show(context); if (result == true) _loadData(showLoading: false); },
         child: const Icon(Icons.add, color: Colors.white),
       ),
     );
   }
 
-    Widget _buildBlockCard(TaskFilter filter, List<TreeTaskItem> tasks, {bool isHovered = false}) {
+  Widget _buildBlockCard(TaskFilter filter, List<TreeTaskItem> tasks, {bool isHovered = false, required bool isDynamicHeight}) {
+    Widget listWidget = tasks.isEmpty ? const Padding(padding: EdgeInsets.all(16), child: Center(child: Text('暂无代办', style: TextStyle(color: Colors.black38, fontSize: 11)))) :
+      ReorderableListView.builder(
+        shrinkWrap: isDynamicHeight,
+        physics: isDynamicHeight ? const NeverScrollableScrollPhysics() : const AlwaysScrollableScrollPhysics(),
+        padding: const EdgeInsets.only(top: 4, bottom: 4), itemCount: tasks.length,
+        proxyDecorator: (Widget child, int index, Animation<double> animation) { return Material(color: Colors.transparent, child: child); },
+        onReorder: (oldIndex, newIndex) async {
+          if (newIndex > oldIndex) newIndex -= 1; final item = tasks.removeAt(oldIndex); tasks.insert(newIndex, item);
+          setState(() { _tasksMap[filter.id!] = tasks; }); await DatabaseHelper.instance.updateTaskOrders(tasks); _loadData(showLoading: false);
+        },
+        itemBuilder: (context, taskIndex) {
+          final task = tasks[taskIndex];
+          
+          String? dateText; Color dateColor = Colors.blue.shade800; Color dateBgColor = Colors.blue.shade50;
+          if (task.targetTime != null) {
+            final now = DateTime.now();
+            final today = DateTime(now.year, now.month, now.day);
+            final target = DateTime(task.targetTime!.year, task.targetTime!.month, task.targetTime!.day);
+            final diffDays = target.difference(today).inDays;
+
+            if (!task.isCompleted && target.isBefore(today)) {
+              // 取消“已过期”，直接显示具体时间并标红
+              dateText = target.year == today.year ? '${target.month}/${target.day}' : '${target.year}/${target.month}/${target.day}';
+              dateColor = Colors.red; dateBgColor = Colors.red.shade50;
+            } else if (diffDays == 0) {
+              dateText = '今天'; dateColor = Colors.orange.shade800; dateBgColor = Colors.orange.shade50;
+            } else if (diffDays == 1) {
+              dateText = '明天'; dateColor = Colors.lightBlue.shade800; dateBgColor = Colors.blue.shade50;
+            } else if (target.year == today.year) {
+              dateText = '${target.month}/${target.day}'; 
+            } else {
+              dateText = '${target.year}/${target.month}/${target.day}'; 
+            }
+          }
+
+          return Padding(
+            key: ValueKey(task.id), padding: const EdgeInsets.only(left: 2, right: 6, bottom: 2),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                SizedBox(
+                  width: 25, height: 25,
+                  child: Transform.scale(scale: 0.95, child: Checkbox(visualDensity: VisualDensity.compact, value: task.isCompleted, activeColor: Colors.lightBlue, materialTapTargetSize: MaterialTapTargetSize.shrinkWrap, shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(4)), onChanged: (val) { if (val != null) _toggleTaskStatus(filter.id!, task, val); })),
+                ),
+                Expanded(
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTap: () async { final result = await TaskBottomSheet.show(context, task: task); if (result == true) _loadData(showLoading: false); },
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 4.0),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(task.title, style: TextStyle(fontSize: 12, color: task.isCompleted ? Colors.black38 : Colors.black87, decoration: task.isCompleted ? TextDecoration.lineThrough : null), maxLines: 1, overflow: TextOverflow.ellipsis),
+                          if (task.description.isNotEmpty) Padding(padding: const EdgeInsets.only(top: 2.0), child: Text(task.description, style: TextStyle(fontSize: 10, color: task.isCompleted ? Colors.black26 : Colors.black54, decoration: task.isCompleted ? TextDecoration.lineThrough : null), maxLines: 1, overflow: TextOverflow.ellipsis)),
+                          
+                          Builder(
+                            builder: (context) {
+                              final visibleTags = task.tags.where((t) => filter.displayTags.any((dt) => dt.id == t.id)).toList();
+                              
+                              return Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  // 1. 如果有指定的标签，另起一行显示标签
+                                  if (visibleTags.isNotEmpty)
+                                    Padding(
+                                      padding: const EdgeInsets.only(top: 4.0),
+                                      child: Wrap(
+                                        spacing: 4, runSpacing: 4,
+                                        children: visibleTags.map((t) => Container(
+                                          padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+                                          decoration: BoxDecoration(color: task.isCompleted ? Colors.grey.shade100 : Colors.blue.shade50, borderRadius: BorderRadius.circular(4)),
+                                          child: Text(t.name, style: TextStyle(fontSize: 9, color: task.isCompleted ? Colors.grey : Colors.blue.shade800)),
+                                        )).toList(),
+                                      ),
+                                    ),
+                                    
+                                  // 2. 无论有没有标签，日期永远单独另起一行放在最下方
+                                  if (dateText != null)
+                                    Padding(
+                                      padding: const EdgeInsets.only(top: 4.0),
+                                      child: Container(
+                                        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+                                        decoration: BoxDecoration(color: task.isCompleted ? Colors.grey.shade100 : dateBgColor, borderRadius: BorderRadius.circular(4)),
+                                        child: Row(
+                                          mainAxisSize: MainAxisSize.min, 
+                                          children: [
+                                            Icon(Icons.calendar_today, size: 8, color: task.isCompleted ? Colors.grey : dateColor), 
+                                            const SizedBox(width: 2), 
+                                            Text(dateText!, style: TextStyle(fontSize: 9, color: task.isCompleted ? Colors.grey : dateColor))
+                                          ]
+                                        ),
+                                      ),
+                                    ),
+                                ],
+                              );
+                            }
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          );
+        },
+      );
+
     return Container(
-      decoration: BoxDecoration(
-        color: isHovered ? Colors.blue.shade100 : Colors.blue.shade50,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: isHovered ? Colors.lightBlue : Colors.blue.shade100, width: isHovered ? 2 : 1),
-      ),
+      decoration: BoxDecoration(color: isHovered ? Colors.blue.shade100 : Colors.blue.shade50, borderRadius: BorderRadius.circular(12), border: Border.all(color: isHovered ? Colors.lightBlue : Colors.blue.shade100, width: isHovered ? 2 : 1)),
       child: Column(
+        mainAxisSize: isDynamicHeight ? MainAxisSize.min : MainAxisSize.max,
         children: [
-          // 【核心修复】：用 SizedBox(height: 24) 严格限制标题行高度，变相把下面的分割线整体上拉 6px
           SizedBox(
             height: 24, 
             child: Padding(
-              padding: const EdgeInsets.fromLTRB(8, 4, 4, 0),
+              padding: const EdgeInsets.fromLTRB(10, 4, 4, 0),
               child: Row(
                 children: [
-                  const Icon(Icons.drag_indicator, color: Colors.black26, size: 14), 
-                  const SizedBox(width: 4),
-                  Expanded(child: Text(filter.name ?? '未命名', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Colors.black87), maxLines: 1, overflow: TextOverflow.ellipsis)), 
+                  Expanded(
+                    child: GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onTap: () async { final result = await Navigator.push(context, MaterialPageRoute(builder: (_) => FilterPage(existingFilter: filter))); if (result == true) _loadData(showLoading: false); },
+                      child: Text(filter.name ?? '未命名', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Colors.black87), maxLines: 1, overflow: TextOverflow.ellipsis),
+                    ),
+                  ), 
                   IconButton(
-                    icon: const Icon(Icons.add, color: Colors.black54, size: 16), 
-                    padding: EdgeInsets.zero, constraints: const BoxConstraints(), splashRadius: 20,
-                    onPressed: () async {
-                      final result = await TaskBottomSheet.show(
-                        context, 
-                        tags: filter.selectedTags, 
-                        date: filter.timeFilter == TimeFilter.today ? DateTime.now() : null
-                      );
-                      if (result == true) _loadData(showLoading: false);
-                    },
+                    icon: const Icon(Icons.add, color: Colors.black54, size: 16), padding: EdgeInsets.zero, constraints: const BoxConstraints(), splashRadius: 20,
+                    onPressed: () async { final result = await TaskBottomSheet.show(context, tags: filter.selectedTags, date: filter.timeFilter == TimeFilter.today ? DateTime.now() : null); if (result == true) _loadData(showLoading: false); },
                   ),
                 ],
               ),
             ),
           ),
-          const SizedBox(height: 2), // 微调分割线上方的视觉缓冲
+          const SizedBox(height: 2), const Divider(height: 1, thickness: 1, indent: 8, endIndent: 8, color: Colors.black12),
           
-          // 恢复正常的分割线
-          const Divider(height: 1, thickness: 1, indent: 8, endIndent: 8, color: Colors.black12),
-          
-          Expanded(
-            child: tasks.isEmpty ? const Center(child: Text('暂无代办', style: TextStyle(color: Colors.black38, fontSize: 11))) :
-              ListView.builder(
-                // 【核心修复】：把代办列表的顶部 Padding 加回来，保持舒适间距
-                padding: const EdgeInsets.only(top: 4, bottom: 4),
-                itemCount: tasks.length,
-                itemBuilder: (context, taskIndex) {
-                  final task = tasks[taskIndex];
-                  return Padding(
-                    padding: const EdgeInsets.only(left: 2, right: 6, bottom: 2),
-                    child: Row(
-                      crossAxisAlignment: CrossAxisAlignment.center,
-                      children: [
-                        SizedBox(
-                          width: 26, height: 26,
-                          child: Checkbox(
-                            visualDensity: VisualDensity.compact,
-                            value: task.isCompleted, activeColor: Colors.lightBlue,
-                            materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(4)),
-                            onChanged: (val) {
-                              if (val != null) _toggleTaskStatus(filter.id!, task, val);
-                            },
-                          ),
-                        ),
-                        Expanded(
-                          child: GestureDetector(
-                            behavior: HitTestBehavior.opaque,
-                            onTap: () async {
-                              final result = await TaskBottomSheet.show(context, task: task);
-                              if (result == true) _loadData(showLoading: false);
-                            },
-                            child: Padding(
-                              padding: const EdgeInsets.symmetric(vertical: 4.0),
-                              child: Text(
-                                task.title, 
-                                style: TextStyle(fontSize: 12, color: task.isCompleted ? Colors.black38 : Colors.black87, decoration: task.isCompleted ? TextDecoration.lineThrough : null), 
-                                maxLines: 1, overflow: TextOverflow.ellipsis
-                              ),
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                  );
-                },
-              ),
-          ),
+          isDynamicHeight ? listWidget : Expanded(child: listWidget),
         ],
       ),
     );

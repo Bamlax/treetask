@@ -5,7 +5,7 @@ import '../models/filter_model.dart';
 
 class DatabaseHelper {
   static const _databaseName = "TreeTaskDB.db";
-  static const _databaseVersion = 5; // 升级为 V5
+  static const _databaseVersion = 9; // 升级为 V9
 
   DatabaseHelper._privateConstructor();
   static final DatabaseHelper instance = DatabaseHelper._privateConstructor();
@@ -19,12 +19,7 @@ class DatabaseHelper {
 
   _initDatabase() async {
     String path = join(await getDatabasesPath(), _databaseName);
-    return await openDatabase(
-      path, 
-      version: _databaseVersion, 
-      onUpgrade: _onUpgrade, 
-      onCreate: _onCreate
-    );
+    return await openDatabase(path, version: _databaseVersion, onUpgrade: _onUpgrade, onCreate: _onCreate);
   }
 
   Future _onUpgrade(Database db, int oldVersion, int newVersion) async {
@@ -33,17 +28,42 @@ class DatabaseHelper {
     await db.execute('DROP TABLE IF EXISTS task_tags');
     await db.execute('DROP TABLE IF EXISTS saved_filters');
     await db.execute('DROP TABLE IF EXISTS filter_groups');
+    await db.execute('DROP TABLE IF EXISTS settings'); // 清理设置表
     await _onCreate(db, newVersion);
   }
 
   Future _onCreate(Database db, int version) async {
-    await db.execute('CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT NOT NULL, description TEXT, targetTime TEXT, isCompleted INTEGER NOT NULL)');
+    await db.execute('CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT NOT NULL, description TEXT, targetTime TEXT, isCompleted INTEGER NOT NULL, sortOrder INTEGER DEFAULT 0)');
     await db.execute('CREATE TABLE tags (id TEXT PRIMARY KEY, name TEXT NOT NULL, parentId TEXT)');
     await db.execute('CREATE TABLE task_tags (taskId TEXT, tagId TEXT, PRIMARY KEY (taskId, tagId), FOREIGN KEY (taskId) REFERENCES tasks (id) ON DELETE CASCADE)');
-    
     await db.execute('CREATE TABLE filter_groups (id TEXT PRIMARY KEY, name TEXT NOT NULL, sortOrder INTEGER DEFAULT 0)');
-    // 改为 customDaysBefore 和 customDaysAfter
-    await db.execute('CREATE TABLE saved_filters (id TEXT PRIMARY KEY, name TEXT NOT NULL, groupId TEXT, sortOrder INTEGER DEFAULT 0, timeFilter TEXT NOT NULL, customDaysBefore INTEGER, customDaysAfter INTEGER, tagIds TEXT NOT NULL)');
+    await db.execute('CREATE TABLE saved_filters (id TEXT PRIMARY KEY, name TEXT NOT NULL, groupIds TEXT NOT NULL, sortOrder INTEGER DEFAULT 0, timeFilter TEXT NOT NULL, customDaysBefore INTEGER, customDaysAfter INTEGER, tagIds TEXT NOT NULL, showCompleted INTEGER DEFAULT 1, displayTagIds TEXT DEFAULT "")');
+    
+    // 新增：设置表
+    await db.execute('CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT)');
+  }
+
+  // ================= 存取系统设置 =================
+  Future<String?> getSetting(String key) async {
+    Database db = await instance.database;
+    final res = await db.query('settings', where: 'key = ?', whereArgs: [key]);
+    if (res.isNotEmpty) return res.first['value'] as String;
+    return null;
+  }
+
+  Future<void> saveSetting(String key, String value) async {
+    Database db = await instance.database;
+    await db.insert('settings', {'key': key, 'value': value}, conflictAlgorithm: ConflictAlgorithm.replace);
+  }
+  // ===============================================
+
+  Future<void> updateGroupOrders(List<FilterGroup> groups) async {
+    Database db = await instance.database;
+    await db.transaction((txn) async {
+      for (int i = 0; i < groups.length; i++) {
+        await txn.update('filter_groups', {'sortOrder': i}, where: 'id = ?', whereArgs: [groups[i].id]);
+      }
+    });
   }
 
   Future<List<FilterGroup>> getGroups() async {
@@ -52,14 +72,24 @@ class DatabaseHelper {
     return maps.map((m) => FilterGroup(id: m['id'] as String, name: m['name'] as String, sortOrder: m['sortOrder'] as int)).toList();
   }
 
-  Future<String> getOrCreateGroupId(String groupName) async {
+  Future<String> createGroup(String groupName) async {
     Database db = await instance.database;
-    final res = await db.query('filter_groups', where: 'name = ?', whereArgs: [groupName]);
-    if (res.isNotEmpty) return res.first['id'] as String;
-    
     final newId = DateTime.now().millisecondsSinceEpoch.toString();
     await db.insert('filter_groups', {'id': newId, 'name': groupName, 'sortOrder': DateTime.now().millisecondsSinceEpoch});
     return newId;
+  }
+
+  Future<void> deleteGroup(String groupId) async {
+    Database db = await instance.database;
+    await db.delete('filter_groups', where: 'id = ?', whereArgs: [groupId]);
+    final filters = await db.query('saved_filters');
+    for (var map in filters) {
+      final gIds = (map['groupIds'] as String).split(',').where((e) => e.isNotEmpty).toList();
+      if (gIds.contains(groupId)) {
+        gIds.remove(groupId);
+        await db.update('saved_filters', {'groupIds': gIds.join(',')}, where: 'id = ?', whereArgs: [map['id']]);
+      }
+    }
   }
 
   Future<void> insertSavedFilter(TaskFilter filter) async {
@@ -67,29 +97,41 @@ class DatabaseHelper {
     await db.insert('saved_filters', {
       'id': filter.id ?? DateTime.now().millisecondsSinceEpoch.toString(),
       'name': filter.name ?? '未命名',
-      'groupId': filter.groupId,
+      'groupIds': filter.groupIds.join(','),
       'sortOrder': filter.sortOrder == 0 ? DateTime.now().millisecondsSinceEpoch : filter.sortOrder,
       'timeFilter': filter.timeFilter.name,
       'customDaysBefore': filter.customDaysBefore,
       'customDaysAfter': filter.customDaysAfter,
       'tagIds': filter.selectedTags.map((e) => e.id).join(','),
+      'showCompleted': filter.showCompleted ? 1 : 0,
+      'displayTagIds': filter.displayTags.map((e) => e.id).join(','),
     }, conflictAlgorithm: ConflictAlgorithm.replace);
   }
 
-  Future<List<TaskFilter>> getSavedFilters(String? groupId) async {
+  Future<List<TaskFilter>> getSavedFilters(String? targetGroupId) async {
     Database db = await instance.database;
-    final maps = await db.query('saved_filters', where: groupId == null ? 'groupId IS NULL' : 'groupId = ?', whereArgs: groupId == null ? null : [groupId], orderBy: 'sortOrder ASC');
+    final maps = await db.query('saved_filters', orderBy: 'sortOrder ASC');
     final tags = await _getAllTagsInternal(db);
-    return maps.map((map) {
+    
+    List<TaskFilter> allFilters = maps.map((map) {
       final tagIds = (map['tagIds'] as String).split(',').where((id) => id.isNotEmpty).toList();
+      final gIds = (map['groupIds'] as String).split(',').where((id) => id.isNotEmpty).toList();
+      final dTagsStr = map['displayTagIds'] as String?;
+      final displayTagIds = dTagsStr != null ? dTagsStr.split(',').where((id) => id.isNotEmpty).toList() : [];
+      final showComp = map['showCompleted'] as int?;
+
       return TaskFilter(
-        id: map['id'] as String, name: map['name'] as String, groupId: map['groupId'] as String?, sortOrder: map['sortOrder'] as int,
+        id: map['id'] as String, name: map['name'] as String, groupIds: gIds, sortOrder: map['sortOrder'] as int,
         timeFilter: TimeFilter.values.firstWhere((e) => e.name == map['timeFilter'], orElse: () => TimeFilter.all),
-        customDaysBefore: map['customDaysBefore'] as int?,
-        customDaysAfter: map['customDaysAfter'] as int?,
+        customDaysBefore: map['customDaysBefore'] as int?, customDaysAfter: map['customDaysAfter'] as int?,
         selectedTags: tags.where((t) => tagIds.contains(t.id)).toList(),
+        showCompleted: showComp == null || showComp == 1,
+        displayTags: tags.where((t) => displayTagIds.contains(t.id)).toList(),
       );
     }).toList();
+
+    if (targetGroupId == null) return allFilters.where((f) => f.groupIds.isEmpty).toList();
+    return allFilters.where((f) => f.groupIds.contains(targetGroupId)).toList();
   }
 
   Future<void> swapFilterOrder(TaskFilter f1, TaskFilter f2) async {
@@ -133,10 +175,24 @@ class DatabaseHelper {
   Future<void> insertTask(TreeTaskItem task) async {
     Database db = await instance.database;
     await db.transaction((txn) async {
-      await txn.insert('tasks', {'id': task.id, 'title': task.title, 'description': task.description, 'targetTime': task.targetTime?.toIso8601String(), 'isCompleted': task.isCompleted ? 1 : 0}, conflictAlgorithm: ConflictAlgorithm.replace);
+      await txn.insert('tasks', {'id': task.id, 'title': task.title, 'description': task.description, 'targetTime': task.targetTime?.toIso8601String(), 'isCompleted': task.isCompleted ? 1 : 0, 'sortOrder': task.sortOrder}, conflictAlgorithm: ConflictAlgorithm.replace);
       await txn.delete('task_tags', where: 'taskId = ?', whereArgs: [task.id]);
       for (var tag in task.tags) await txn.insert('task_tags', {'taskId': task.id, 'tagId': tag.id});
     });
+  }
+
+  Future<void> updateTaskOrders(List<TreeTaskItem> tasks) async {
+    Database db = await instance.database;
+    await db.transaction((txn) async {
+      for (int i = 0; i < tasks.length; i++) {
+        await txn.update('tasks', {'sortOrder': i}, where: 'id = ?', whereArgs: [tasks[i].id]);
+      }
+    });
+  }
+
+  Future<void> deleteTask(String taskId) async {
+    Database db = await instance.database;
+    await db.delete('tasks', where: 'id = ?', whereArgs: [taskId]);
   }
 
   Future<void> updateTaskCompletion(String taskId, bool isCompleted) async {
@@ -148,35 +204,26 @@ class DatabaseHelper {
     Database db = await instance.database;
     String whereClause = '1=1';
     List<dynamic> whereArgs = [];
-    DateTime now = DateTime.now();
-    DateTime today = DateTime(now.year, now.month, now.day);
+    DateTime today = DateTime(DateTime.now().year, DateTime.now().month, DateTime.now().day);
     
+    if (!filter.showCompleted) whereClause += ' AND isCompleted = 0';
+
     if (filter.timeFilter == TimeFilter.overdue) {
-      whereClause += ' AND targetTime < ? AND isCompleted = 0'; 
-      whereArgs.add(today.toIso8601String());
+      whereClause += ' AND targetTime < ? AND isCompleted = 0'; whereArgs.add(today.toIso8601String());
     } else if (filter.timeFilter == TimeFilter.today) {
-      final end = today.add(const Duration(days: 1));
-      whereClause += ' AND targetTime >= ? AND targetTime < ?'; whereArgs.addAll([today.toIso8601String(), end.toIso8601String()]);
+      final end = today.add(const Duration(days: 1)); whereClause += ' AND targetTime >= ? AND targetTime < ?'; whereArgs.addAll([today.toIso8601String(), end.toIso8601String()]);
     } else if (filter.timeFilter == TimeFilter.tomorrow) {
-      final start = today.add(const Duration(days: 1)); final end = start.add(const Duration(days: 1));
-      whereClause += ' AND targetTime >= ? AND targetTime < ?'; whereArgs.addAll([start.toIso8601String(), end.toIso8601String()]);
+      final start = today.add(const Duration(days: 1)); final end = start.add(const Duration(days: 1)); whereClause += ' AND targetTime >= ? AND targetTime < ?'; whereArgs.addAll([start.toIso8601String(), end.toIso8601String()]);
     } else if (filter.timeFilter == TimeFilter.week) {
-      final start = today.subtract(Duration(days: today.weekday - 1)); final end = start.add(const Duration(days: 7));
-      whereClause += ' AND targetTime >= ? AND targetTime < ?'; whereArgs.addAll([start.toIso8601String(), end.toIso8601String()]);
+      final start = today.subtract(Duration(days: today.weekday - 1)); final end = start.add(const Duration(days: 7)); whereClause += ' AND targetTime >= ? AND targetTime < ?'; whereArgs.addAll([start.toIso8601String(), end.toIso8601String()]);
     } else if (filter.timeFilter == TimeFilter.nextWeek) {
-      final start = today.subtract(Duration(days: today.weekday - 1)).add(const Duration(days: 7)); final end = start.add(const Duration(days: 7));
-      whereClause += ' AND targetTime >= ? AND targetTime < ?'; whereArgs.addAll([start.toIso8601String(), end.toIso8601String()]);
+      final start = today.subtract(Duration(days: today.weekday - 1)).add(const Duration(days: 7)); final end = start.add(const Duration(days: 7)); whereClause += ' AND targetTime >= ? AND targetTime < ?'; whereArgs.addAll([start.toIso8601String(), end.toIso8601String()]);
     } else if (filter.timeFilter == TimeFilter.month) {
-      final start = DateTime(today.year, today.month, 1); final end = DateTime(today.year, today.month + 1, 1);
-      whereClause += ' AND targetTime >= ? AND targetTime < ?'; whereArgs.addAll([start.toIso8601String(), end.toIso8601String()]);
+      final start = DateTime(today.year, today.month, 1); final end = DateTime(today.year, today.month + 1, 1); whereClause += ' AND targetTime >= ? AND targetTime < ?'; whereArgs.addAll([start.toIso8601String(), end.toIso8601String()]);
     } else if (filter.timeFilter == TimeFilter.nextMonth) {
-      final start = DateTime(today.year, today.month + 1, 1); final end = DateTime(today.year, today.month + 2, 1);
-      whereClause += ' AND targetTime >= ? AND targetTime < ?'; whereArgs.addAll([start.toIso8601String(), end.toIso8601String()]);
+      final start = DateTime(today.year, today.month + 1, 1); final end = DateTime(today.year, today.month + 2, 1); whereClause += ' AND targetTime >= ? AND targetTime < ?'; whereArgs.addAll([start.toIso8601String(), end.toIso8601String()]);
     } else if (filter.timeFilter == TimeFilter.customDays && filter.customDaysBefore != null && filter.customDaysAfter != null) {
-      // 全新的自定义天数段逻辑（以今天为基准）
-      final start = today.subtract(Duration(days: filter.customDaysBefore!));
-      final end = today.add(Duration(days: filter.customDaysAfter! + 1));
-      whereClause += ' AND targetTime >= ? AND targetTime < ?'; whereArgs.addAll([start.toIso8601String(), end.toIso8601String()]);
+      final start = today.subtract(Duration(days: filter.customDaysBefore!)); final end = today.add(Duration(days: filter.customDaysAfter! + 1)); whereClause += ' AND targetTime >= ? AND targetTime < ?'; whereArgs.addAll([start.toIso8601String(), end.toIso8601String()]);
     }
 
     if (filter.selectedTags.isNotEmpty) {
@@ -186,17 +233,16 @@ class DatabaseHelper {
       whereArgs.addAll(tagIds);
     }
 
-    final taskMaps = await db.query('tasks', where: whereClause, whereArgs: whereArgs, orderBy: 'targetTime ASC');
+    final taskMaps = await db.query('tasks', where: whereClause, whereArgs: whereArgs, orderBy: 'sortOrder ASC, targetTime ASC');
     List<TreeTaskItem> tasks = [];
-    
     for (Map<String, Object?> map in taskMaps) {
       String taskId = map['id'] as String;
       final tagMaps = await db.rawQuery('SELECT t.* FROM tags t INNER JOIN task_tags tt ON t.id = tt.tagId WHERE tt.taskId = ?', [taskId]);
       List<Tag> taskTags = tagMaps.map((t) => Tag(id: t['id'] as String, name: t['name'] as String, parentId: t['parentId'] as String?)).toList();
-      
       tasks.add(TreeTaskItem(
         id: taskId, title: map['title'] as String, description: map['description'] as String, 
-        targetTime: map['targetTime'] != null ? DateTime.parse(map['targetTime'] as String) : null, tags: taskTags, isCompleted: (map['isCompleted'] as int) == 1
+        targetTime: map['targetTime'] != null ? DateTime.parse(map['targetTime'] as String) : null, 
+        tags: taskTags, isCompleted: (map['isCompleted'] as int) == 1, sortOrder: map['sortOrder'] as int
       ));
     }
     return tasks;

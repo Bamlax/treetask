@@ -9,9 +9,10 @@ class TreeTaskItem {
   final String id;
   final String title;
   final String description;
-  final DateTime? targetTime; // 允许为空
-  final List<Tag> tags; // 允许为空列表
+  final DateTime? targetTime; 
+  final List<Tag> tags; 
   final bool isCompleted;
+  final int sortOrder; // 新增：用于拖拽排序
 
   TreeTaskItem({
     required this.id,
@@ -20,5 +21,6 @@ class TreeTaskItem {
     this.targetTime,
     this.tags = const [],
     this.isCompleted = false,
+    this.sortOrder = 0,
   });
 }
