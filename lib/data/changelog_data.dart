@@ -12,6 +12,14 @@ class ChangelogEntry {
 
 const List<ChangelogEntry> changelogData = [
   ChangelogEntry(
+    version: 'v0.3.0',
+    date: '2026-04-27',
+    changes: [
+      '新增习惯打卡功能',
+      '完善标签界面的管理功能',
+    ],
+  ),
+  ChangelogEntry(
     version: 'v0.2.0',
     date: '2026-04-19',
     changes: [
